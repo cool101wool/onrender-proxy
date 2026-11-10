@@ -6,11 +6,11 @@ import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { Agent, fetch } from 'undici';
 import { WebSocketServer, WebSocket } from 'ws';
-import { safeLookup, assertHostAllowed } from './lib/safe.js';
+import { safeLookup, assertHostAllowed } from './safe.js';
 import {
   toProxy, parseProxyUrl, rewriteHtml, rewriteCss, rewriteJs,
   rewriteRefresh, rewriteLinkHeader, rewriteSetCookie,
-} from './lib/rewrite.js';
+} from './rewrite.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
@@ -18,8 +18,8 @@ const ACCESS_KEY = process.env.ACCESS_KEY || '';
 const MAX_BODY_IN = 50 * 1024 * 1024;
 const MAX_REWRITE = 15 * 1024 * 1024;
 
-const INDEX_HTML = fs.readFileSync(path.join(__dirname, 'public/index.html'));
-const RUNTIME_JS = fs.readFileSync(path.join(__dirname, 'public/runtime.js'));
+const INDEX_HTML = fs.readFileSync(path.join(__dirname, 'index.html'));
+const RUNTIME_JS = fs.readFileSync(path.join(__dirname, 'runtime.js'));
 
 const dispatcher = new Agent({
   connect: { lookup: safeLookup, timeout: 10_000 },
