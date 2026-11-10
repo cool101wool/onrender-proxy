@@ -24,6 +24,7 @@ const RUNTIME_JS = fs.readFileSync(path.join(__dirname, 'runtime.js'));
 const dispatcher = new Agent({
   connect: { lookup: safeLookup, timeout: 10_000 },
   headersTimeout: 30_000,
+  maxHeaderSize: 1024 * 1024, // YouTube etc. send >16KB of headers (UND_ERR_HEADERS_OVERFLOW)
   bodyTimeout: 0,
 });
 
@@ -245,7 +246,7 @@ async function handle(req, res) {
   return page(res, 404, 'Not found', '<p>Go to the <a style="color:#7aa2ff" href="/">start page</a> and enter a URL.</p>');
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer({ maxHeaderSize: 128 * 1024 }, (req, res) => { // big cookies from the browser
   handle(req, res).catch((e) => {
     console.error(e);
     if (!res.headersSent) page(res, e.status || 500, 'Proxy error', `<p>${esc(e.message)}</p>`);
