@@ -17,6 +17,14 @@
   button { padding:12px 18px; border-radius:10px; border:0; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
   input:focus-visible, button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   small { display:block; margin-top:14px; color:var(--muted); }
+  details { margin-top:22px; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 16px; }
+  summary { cursor:pointer; font-weight:600; }
+  details p { margin:10px 0 12px; font-size:14px; }
+  details code { background:var(--bg); padding:1px 6px; border-radius:6px; border:1px solid var(--line); }
+  .row { display:flex; gap:8px; }
+  .st { margin-top:10px; font-size:14px; }
+  .ok { color:#3ecf8e; } .bad { color:#ff6b6b; }
+  button.sec { background:transparent; color:var(--fg); border:1px solid var(--line); }
 </style>
 </head>
 <body>
@@ -28,6 +36,18 @@
     <button>Go</button>
   </form>
   <small>Redirects (HTTP, meta refresh, JavaScript) stay inside the proxy.</small>
+
+  <details id="exit" hidden>
+    <summary>Use another computer's internet connection</summary>
+    <p>Sites will see that computer's IP address instead of this server's. On the other computer run
+      <code>node agent.js <span id="me"></span></code>, press <b>Allow sharing</b> there, choose a PIN, then enter it here.</p>
+    <div class="row" id="enter">
+      <input id="pin" inputmode="numeric" maxlength="8" autocomplete="off" placeholder="PIN" aria-label="PIN">
+      <button id="pinGo" type="button">Connect</button>
+    </div>
+    <div class="row" id="leave" hidden><button id="pinOff" class="sec" type="button">Disconnect</button></div>
+    <div class="st" id="exitSt" role="status"></div>
+  </details>
 </main>
 <script>
   document.getElementById('f').addEventListener('submit', function (e) {
@@ -43,6 +63,27 @@
       location.href = '/p/' + u.protocol.slice(0, -1) + '/' + u.host + u.pathname + u.search + u.hash;
     } catch (err) { alert('That does not look like a valid URL'); }
   });
+
+  (function () {
+    var $ = function (i) { return document.getElementById(i); };
+    $('me').textContent = location.origin;
+    function render(s) {
+      $('exit').hidden = !s.enabled;
+      $('enter').hidden = s.connected; $('leave').hidden = !s.connected;
+      $('exitSt').innerHTML = s.connected ? '<span class="ok">Browsing through the other computer.</span>'
+        : s.offline ? '<span class="bad">That computer stopped sharing. Enter a new PIN or disconnect.</span>' : '';
+      if (s.offline) $('leave').hidden = false;
+    }
+    function load() { fetch('/__pl/exit/status').then(function (r) { return r.json(); }).then(render).catch(function () {}); }
+    $('pinGo').onclick = function () {
+      fetch('/__pl/exit/connect', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pin: $('pin').value }) })
+        .then(function (r) { return r.json(); })
+        .then(function (j) { if (j.ok) { $('pin').value = ''; load(); } else $('exitSt').innerHTML = '<span class="bad">' + j.error + '</span>'; });
+    };
+    $('pin').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('pinGo').click(); });
+    $('pinOff').onclick = function () { location.href = '/__pl/exit/off'; };
+    load();
+  })();
 </script>
 </body>
 </html>

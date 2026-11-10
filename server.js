@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Agent, fetch } from 'undici';
 import { WebSocketServer, WebSocket } from 'ws';
 import { safeLookup, assertHostAllowed } from './safe.js';
+import { createExit } from './exit.js';
 import {
   toProxy, parseProxyUrl, rewriteHtml, rewriteCss, rewriteJs,
   rewriteRefresh, rewriteLinkHeader, rewriteSetCookie,
@@ -61,6 +62,8 @@ async function readBody(req, limit) {
   return Buffer.concat(chunks);
 }
 
+const exit = createExit({ ACCESS_KEY, authToken, safeEq, parseCookies, isHttps, readBody });
+
 function decode(buf, ct) {
   let label = (/charset=["']?([\w-]+)/i.exec(ct) || [])[1];
   if (!label) label = (/<meta[^>]+charset=["']?([\w-]+)/i.exec(buf.subarray(0, 2048).toString('latin1')) || [])[1] || 'utf-8';
@@ -97,16 +100,17 @@ const DROP_REQ = new Set([
   'cdn-loop', 'rndr-id', 'true-client-ip', 'priority', 'upgrade-insecure-requests', 'te',
 ]);
 
-function upstreamHeaders(req, target) {
+function upstreamHeaders(req, target, spoof = true) {
+  const ua = spoof ? SPOOF_UA : null;
   const h = new Headers();
   for (const [k, v] of Object.entries(req.headers)) {
     if (DROP_REQ.has(k) || k.startsWith('x-forwarded-') || k.startsWith('x-render') || k.startsWith('cf-') || k.startsWith('sec-fetch-')) continue;
-    if (SPOOF_UA && (k.startsWith('sec-ch-ua') || k === 'user-agent')) continue; // Chrome client hints would contradict a Firefox UA
+    if (ua && (k.startsWith('sec-ch-ua') || k === 'user-agent')) continue; // Chrome client hints would contradict a Firefox UA
     if (k === 'cookie') continue;
     h.set(k, Array.isArray(v) ? v.join(', ') : v);
   }
-  if (SPOOF_UA) h.set('user-agent', SPOOF_UA);
-  const cookies = (req.headers.cookie || '').split(/;\s*/).filter((c) => c && !/^__pl_(o|key)=/.test(c)).map((c) => c.replace(/^__plh-/, '__Host-'));
+  if (ua) h.set('user-agent', ua);
+  const cookies = (req.headers.cookie || '').split(/;\s*/).filter((c) => c && !/^__pl_(o|key|exit)=/.test(c)).map((c) => c.replace(/^__plh-/, '__Host-'));
   if (cookies.length) h.set('cookie', cookies.join('; '));
   // Origin/Referer must look like the real site, not the proxy.
   const fix = (v) => { try { const u = new URL(v); const p = parseProxyUrl(u.pathname + u.search); return p ? p.url.href : v; } catch { return v; } };
@@ -120,12 +124,21 @@ function upstreamHeaders(req, target) {
 
 /* ----------------------------------------------------------------- proxy */
 
+function remoteGone(res) {
+  return page(res, 503, 'The other computer is not sharing',
+    '<p>The computer you were browsing through stopped sharing or disconnected. Ask for a new PIN, or switch back to this server\'s own connection.</p>' +
+    '<p><a style="color:#7aa2ff" href="/__pl/exit/off">Disconnect and go back to the start page</a></p>');
+}
+
 async function proxy(req, res, p, urlObj) {
   const target = p.url;
   if (!/^https?:$/.test(target.protocol)) return page(res, 400, 'Bad request', '<p>Only http(s) targets are supported here.</p>');
   if (!p.hasPath) { res.writeHead(302, { location: req.url.replace(/^(\/p\/[a-z]+\/[^/?#]+)/, '$1/') }); return res.end(); }
   if (target.host === req.headers.host) return page(res, 400, 'Loop detected', '<p>That URL points back at this proxy.</p>');
   try { assertHostAllowed(target.hostname); } catch (e) { return page(res, 403, 'Blocked', `<p>${esc(e.message)}</p>`); }
+
+  const ex = exit.getExit(req);
+  if (ex && ex.gone) return remoteGone(res);
 
   const method = req.method;
   const body = (method === 'GET' || method === 'HEAD') ? undefined : await readBody(req, MAX_BODY_IN);
@@ -134,14 +147,21 @@ async function proxy(req, res, p, urlObj) {
 
   let up;
   try {
-    up = await fetch(target.href, {
-      method, body, headers: upstreamHeaders(req, target), dispatcher,
-      redirect: 'manual',            // we hand every redirect back to the browser, rewritten
-      signal: ac.signal,
-    });
+    if (ex) {
+      // Browsing through another computer: its agent performs the request, so the site sees its IP.
+      // The visitor's own headers are passed through untouched (no UA override) to look like a normal browser.
+      up = await exit.remoteFetch(ex.host, { method, url: target.href, headers: [...upstreamHeaders(req, target, false)], body }, ac.signal);
+    } else {
+      up = await fetch(target.href, {
+        method, body, headers: upstreamHeaders(req, target), dispatcher,
+        redirect: 'manual',            // we hand every redirect back to the browser, rewritten
+        signal: ac.signal,
+      });
+    }
   } catch (e) {
     const cause = e.cause || e;
     console.error(`[upstream error] ${method} ${target.href.slice(0, 200)} -> ${cause.code || cause.message}`);
+    if (cause.code === 'PL_REMOTE_OFFLINE') return remoteGone(res);
     if (cause.code === 'PL_BLOCKED') return page(res, 403, 'Blocked', `<p>${esc(cause.message)}</p>`);
     if (ac.signal.aborted) return;
     return page(res, 502, 'Could not reach site', `<p>${esc(target.host)}: ${esc(cause.code || cause.message)}</p>`);
@@ -223,6 +243,8 @@ async function handle(req, res) {
     }
   }
 
+  if (u.pathname.startsWith('/__pl/exit/') && await exit.route(req, res, u)) return;
+
   if (u.pathname === '/' || u.pathname === '/index.html') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     return res.end(INDEX_HTML);
@@ -267,7 +289,9 @@ const server = http.createServer({ maxHeaderSize: 128 * 1024 }, (req, res) => { 
 
 server.on('upgrade', (req, socket, head) => {
   const fail = (code = 400) => { socket.write(`HTTP/1.1 ${code} Error\r\nConnection: close\r\n\r\n`); socket.destroy(); };
+  if (new URL(req.url, 'http://x').pathname === '/__pl/agent') return exit.handleAgentUpgrade(req, socket, head);
   if (!isAuthed(req)) return fail(401);
+  if (exit.getExit(req)) return fail(501); // WebSockets are not tunnelled through another computer
   const p = parseProxyUrl(req.url);
   if (!p) return fail(404);
   const t = p.url;
@@ -281,7 +305,7 @@ server.on('upgrade', (req, socket, head) => {
     origin: `${proto === 'wss:' ? 'https' : 'http'}://${t.host}`,
     'user-agent': SPOOF_UA || req.headers['user-agent'] || '',
   };
-  const cookies = (req.headers.cookie || '').split(/;\s*/).filter((c) => c && !/^__pl_(o|key)=/.test(c)).map((c) => c.replace(/^__plh-/, '__Host-'));
+  const cookies = (req.headers.cookie || '').split(/;\s*/).filter((c) => c && !/^__pl_(o|key|exit)=/.test(c)).map((c) => c.replace(/^__plh-/, '__Host-'));
   if (cookies.length) headers.cookie = cookies.join('; ');
 
   const upstream = new WebSocket(t.href, protocols, { headers, lookup: safeLookup, handshakeTimeout: 15_000 });
@@ -301,3 +325,15 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(PORT, () => console.log(`proxy listening on :${PORT}${ACCESS_KEY ? ' (access key required)' : ' (NO access key set)'}`));
+
+/* -------------------------------------------------------------- keepalive */
+// Render's free plan stops an instance after ~15 min without inbound traffic. Requests to our own PUBLIC url count
+// as traffic, so we ping it every ~10 minutes. (Render sets RENDER_EXTERNAL_URL automatically.)
+const SELF_URL = process.env.KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL;
+if (SELF_URL && process.env.KEEPALIVE !== 'off') {
+  const ping = () => fetch(new URL('/healthz', SELF_URL).href, { headers: { 'user-agent': 'render-proxy-keepalive' } })
+    .then((r) => r.arrayBuffer()).catch((e) => console.warn('[keepalive] ping failed:', (e.cause || e).code || e.message));
+  const loop = () => setTimeout(() => { ping(); loop(); }, (9 + Math.random() * 2) * 60_000);
+  loop();
+  console.log(`keepalive: pinging ${SELF_URL}/healthz every ~10 min`);
+}
