@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Share this connection</title>
+<style>
+  :root { --bg:#0f1115; --fg:#e6e6e6; --muted:#8b93a1; --card:#181b22; --line:#2a2f3a; --accent:#4f7cff; --ok:#3ecf8e; --bad:#ff6b6b; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f6f7f9; --fg:#14161a; --muted:#5d6675; --card:#fff; --line:#dfe3ea; } }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui,sans-serif; padding:16px; }
+  main { width:100%; max-width:580px; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:22px; }
+  h1 { font-size:21px; margin:0 0 4px; }
+  p { color:var(--muted); margin:0 0 14px; }
+  label { display:block; font-size:14px; color:var(--muted); margin:12px 0 4px; }
+  input, select { width:100%; padding:11px 12px; border-radius:10px; border:1px solid var(--line); background:var(--bg); color:var(--fg); font:inherit; }
+  button, .btn { display:inline-block; margin-top:14px; padding:11px 18px; border-radius:10px; border:0; background:var(--accent); color:#fff; font:inherit; cursor:pointer; text-decoration:none; }
+  button.stop { background:var(--bad); } button.sec, .btn.sec { background:transparent; color:var(--fg); border:1px solid var(--line); }
+  button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .box { padding:12px 14px; border:1px solid var(--line); border-radius:10px; margin:12px 0; background:var(--bg); }
+  code { font:14px ui-monospace,Menlo,Consolas,monospace; word-break:break-all; }
+  .cmd { display:flex; gap:8px; align-items:center; } .cmd code { flex:1; }
+  .cmd button { margin:0; padding:7px 12px; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  ul { margin:6px 0 0; padding-left:18px; color:var(--muted); font-size:14px; }
+  ol { padding-left:20px; margin:8px 0; } li { margin:4px 0; }
+  [hidden] { display:none !important; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Share this computer's connection</h1>
+  <p>Another computer that knows your PIN will be able to browse the web through <b>this</b> computer's internet, and sites will see this computer's IP address. It can't reach your local network. Nothing is shared until you press the button.</p>
+
+  <div id="disabled" class="box bad" hidden>Sharing is disabled: set an <code>ACCESS_KEY</code> on the server first.</div>
+
+  <!-- step 1 -->
+  <section id="s1" hidden>
+    <label for="pin">Choose a PIN to give the other computer (4 to 8 digits)</label>
+    <input id="pin" inputmode="numeric" maxlength="8" autocomplete="off" placeholder="e.g. 482915">
+    <label for="min">Stop sharing automatically after</label>
+    <select id="min"><option value="30">30 minutes</option><option value="60" selected>1 hour</option><option value="240">4 hours</option><option value="480">8 hours</option></select>
+    <button id="go" type="button">Allow sharing</button>
+    <div id="err" class="bad" role="alert"></div>
+  </section>
+
+  <!-- step 2 -->
+  <section id="s2" hidden>
+    <div class="box">
+      <b>Now start the helper on this computer</b>
+      <ol>
+        <li>Install <a href="https://nodejs.org" target="_blank" rel="noopener">Node.js</a> 22 or newer if you don't have it.</li>
+        <li><a href="/agent.js" download="agent.js">Download agent.js</a> (one file, nothing else to install).</li>
+        <li>Open a terminal in the same folder and run:</li>
+      </ol>
+      <div style="margin:4px 0 10px">
+        <div style="color:var(--muted);font-size:14px;margin-bottom:4px">Which connection should be shared?</div>
+        <label style="display:block;margin:2px 0;color:var(--fg)"><input type="radio" name="conn" value="normal" checked style="width:auto"> This computer's normal internet</label>
+        <label style="display:block;margin:2px 0;color:var(--fg)"><input type="radio" name="conn" value="tor" style="width:auto"> Tor Browser's connection (leave Tor Browser open while sharing)</label>
+      </div>
+      <div class="cmd"><code id="cmd"></code><button id="copy" type="button" class="sec">Copy</button></div>
+    </div>
+    <div class="st" id="wait" role="status">Waiting for the helper to connect. The code works for <span id="left"></span>.</div>
+    <button id="cancel" class="sec" type="button">Cancel</button>
+  </section>
+
+  <!-- step 3 -->
+  <section id="s3" hidden>
+    <div class="box">
+      <div role="status"><b class="ok">Sharing is ON</b> <span id="how"></span></div>
+      <div style="margin-top:6px">PIN: <b id="pinShow"></b> &nbsp;&middot;&nbsp; <span id="v"></span> &nbsp;&middot;&nbsp; <span id="r"></span> &nbsp;&middot;&nbsp; stops in <span id="t"></span></div>
+      <div style="margin-top:10px;color:var(--muted);font-size:14px">Recent requests</div>
+      <ul id="recent"></ul>
+    </div>
+    <button id="stop" class="stop" type="button">Stop sharing</button>
+  </section>
+
+  <p style="margin-top:16px"><a href="/">Back to the proxy</a></p>
+</main>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var shownPin = '', lastCode = '';
+  function updateCmd() {
+    var tor = document.querySelector('input[name=conn]:checked').value === 'tor';
+    $('cmd').textContent = 'node agent.js ' + location.origin + ' ' + lastCode + (tor ? ' --tor' : '');
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('input[name=conn]'), function (r) { r.addEventListener('change', updateCmd); });
+  function api(path, body) {
+    return fetch(path, body ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : {})
+      .then(function (r) { return r.json(); });
+  }
+  function fmt(ms) { var s = Math.max(0, Math.round(ms / 1000)); var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return (h ? h + 'h ' : '') + m + 'm ' + ('0' + s % 60).slice(-2) + 's'; }
+  function esc(t) { return String(t).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+  function show(n) { ['s1', 's2', 's3'].forEach(function (k) { $(k).hidden = k !== n; }); }
+
+  function render(s) {
+    if (s.enabled === false) { $('disabled').hidden = false; show(''); return; }
+    if (s.state === 'waiting') {
+      show('s2');
+      lastCode = s.code; updateCmd();
+      $('left').textContent = fmt(s.codeExpiresAt - Date.now());
+    } else if (s.state === 'active' || s.state === 'reconnecting') {
+      show('s3');
+      $('pinShow').textContent = shownPin || '(the PIN you chose)';
+      $('how').textContent = s.state === 'reconnecting' ? '(helper reconnecting...)' : '';
+      $('v').textContent = s.viewers + ' computer' + (s.viewers === 1 ? '' : 's') + ' connected';
+      $('r').textContent = s.reqs + ' requests';
+      $('t').textContent = fmt(s.expiresAt - Date.now());
+      $('recent').innerHTML = (s.recent || []).map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') || '<li>none yet</li>';
+    } else {
+      show('s1');
+      if (s.state === 'ended' && !$('err').textContent) $('err').textContent = 'Sharing has ended.';
+    }
+  }
+  function poll() { api('/__pl/exit/offer').then(render).catch(function () {}); }
+
+  $('go').onclick = function () {
+    $('err').textContent = '';
+    var pin = $('pin').value.trim();
+    api('/__pl/exit/offer', { pin: pin, minutes: $('min').value }).then(function (j) {
+      if (!j.ok) { $('err').textContent = j.error; return; }
+      shownPin = pin; $('pin').value = ''; render(j);
+    });
+  };
+  $('pin').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('go').click(); });
+  $('stop').onclick = $('cancel').onclick = function () { api('/__pl/exit/offer/stop', {}).then(function () { shownPin = ''; $('err').textContent = ''; poll(); }); };
+  $('copy').onclick = function () {
+    var t = $('cmd').textContent;
+    (navigator.clipboard ? navigator.clipboard.writeText(t) : Promise.reject()).then(function () { $('copy').textContent = 'Copied'; setTimeout(function () { $('copy').textContent = 'Copy'; }, 1500); }, function () {});
+  };
+  poll(); setInterval(poll, 1500);
+})();
+</script>
+</body>
+</html>

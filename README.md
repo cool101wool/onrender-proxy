@@ -32,17 +32,25 @@ Use this when sites block Render's datacenter IP (captchas, "unusual traffic") a
 Computer A (shares its connection)  --tunnel-->  your Render app  <--  Computer B (browses)
 ```
 
-1. Set `ACCESS_KEY` on Render (this mode is disabled without it).
-2. **On computer A** (needs Node 20+): unzip this project, run `npm install`, then `node agent.js https://YOUR-APP.onrender.com`. A page opens on A at `127.0.0.1`. Enter the access key, choose a **PIN (4 to 8 digits)** and a time limit, and press **Allow sharing**. Nothing is shared until you press it, and **Stop sharing** ends it immediately.
-3. **On computer B**: open the proxy start page, expand *Use another computer's internet connection*, enter the PIN, press Connect. All browsing now goes out from A. *Disconnect* switches back to Render's own connection.
+Set `ACCESS_KEY` on Render first (this mode is disabled without it).
 
-Safety: A's agent refuses localhost / private / LAN addresses, so B can never reach A's home network. The PIN is rate-limited (5 wrong tries per 10 min per address, global lockout after 15). Sharing auto-stops after the chosen time. A's page lists the sites being requested. While A is offline B gets an error page, never a silent fallback to Render's IP.
-Limits: WebSockets are not tunnelled in this mode; B must re-enter the PIN if A restarts; keep the agent's terminal open.
-Headless use (running the command is your consent): `node agent.js URL --arm --pin 123456 --key ACCESS_KEY --minutes 60`.
+**Computer A, the connection being shared**
+1. Open `https://YOUR-APP.onrender.com/share` in a browser, choose a **PIN (4 to 8 digits)** and a time limit, press **Allow sharing**.
+2. The page shows a one-time command. Download `agent.js` from the page (one file, no `npm install`; needs **Node 22+**) and run the command it shows, e.g. `node agent.js https://YOUR-APP.onrender.com ABCD-EFGH`. The code works once and expires after 10 minutes.
+3. The page flips to "Sharing is ON" with live status and recent requests. **Stop sharing** (or Ctrl+C) ends it immediately; it also stops by itself when the time is up.
+
+**Computer B, the one browsing**: open the proxy start page, expand *Use another computer's internet connection*, enter the PIN, press Connect. All browsing now exits from A. *Disconnect* switches back to Render's own connection.
+
+**Sharing Tor Browser's connection:** tick *Tor Browser's connection* on the `/share` page (the command gains `--tor`). The helper then sends everything through Tor Browser's SOCKS port (9150, or 9050 for the tor service), so B exits from a Tor exit node. Tor Browser must stay open. Hostnames are resolved inside Tor (no DNS leak, `.onion` sites work). Any other SOCKS5 proxy: `--socks host:port`. Expect more captchas and slower pages than a normal connection.
+
+Why a helper at all? A web page can't act as a general internet connection (browsers only let pages read cross-site responses when the site opts in, and they can't set cookies or follow redirects like a proxy must). The helper is the small part that makes real requests from A.
+
+Safety: the helper refuses localhost / private / LAN addresses, so B can never reach A's home network. PIN guesses are rate-limited (5 wrong tries per 10 min per address, global lockout after 15). While A is offline B gets an error page, never a silent fallback to Render's IP.
+Limits: WebSockets aren't tunnelled in this mode; B must re-enter the PIN if A's helper restarts; keep A's terminal open.
 
 ## Keepalive
 
-Render's free plan sleeps an instance after ~15 minutes without traffic. The server pings its own public URL (`RENDER_EXTERNAL_URL`, set by Render) every ~10 minutes, and the agent pings it every 4 minutes while sharing. Disable with `KEEPALIVE=off`. One free service running 24/7 uses about 744 of Render's 750 free instance hours per month, so don't run several free services at once.
+Render's free plan sleeps an instance after ~15 minutes without traffic. The server pings its own public URL (`RENDER_EXTERNAL_URL`, set by Render) every ~10 minutes, and the helper pings it every 4 minutes while sharing. Disable with `KEEPALIVE=off`. One free service running 24/7 uses about 744 of Render's 750 free instance hours per month, so don't run several free services at once.
 
 ## Security notes
 

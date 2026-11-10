@@ -39,14 +39,15 @@
 
   <details id="exit" hidden>
     <summary>Use another computer's internet connection</summary>
-    <p>Sites will see that computer's IP address instead of this server's. On the other computer run
-      <code>node agent.js <span id="me"></span></code>, press <b>Allow sharing</b> there, choose a PIN, then enter it here.</p>
+    <p>Sites will see that computer's IP address instead of this server's. On the other computer open
+      <code><span id="me"></span>/share</code>, press <b>Allow sharing</b> and choose a PIN, then enter that PIN here.</p>
     <div class="row" id="enter">
       <input id="pin" inputmode="numeric" maxlength="8" autocomplete="off" placeholder="PIN" aria-label="PIN">
       <button id="pinGo" type="button">Connect</button>
     </div>
     <div class="row" id="leave" hidden><button id="pinOff" class="sec" type="button">Disconnect</button></div>
     <div class="st" id="exitSt" role="status"></div>
+    <p style="margin:12px 0 0">Want to lend <b>this</b> computer's connection instead? <a href="/share" style="color:var(--accent)">Share it</a>.</p>
   </details>
 </main>
 <script>

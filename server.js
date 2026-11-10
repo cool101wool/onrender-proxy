@@ -26,6 +26,8 @@ const MAX_REWRITE = 15 * 1024 * 1024;
 
 const INDEX_HTML = fs.readFileSync(path.join(__dirname, 'index.html'));
 const RUNTIME_JS = fs.readFileSync(path.join(__dirname, 'runtime.js'));
+const SHARE_HTML = fs.readFileSync(path.join(__dirname, 'share.html'));
+const AGENT_JS = fs.readFileSync(path.join(__dirname, 'agent.js'));
 
 const dispatcher = new Agent({
   connect: { lookup: safeLookup, timeout: 10_000 },
@@ -110,7 +112,7 @@ function upstreamHeaders(req, target, spoof = true) {
     h.set(k, Array.isArray(v) ? v.join(', ') : v);
   }
   if (ua) h.set('user-agent', ua);
-  const cookies = (req.headers.cookie || '').split(/;\s*/).filter((c) => c && !/^__pl_(o|key|exit)=/.test(c)).map((c) => c.replace(/^__plh-/, '__Host-'));
+  const cookies = (req.headers.cookie || '').split(/;\s*/).filter((c) => c && !/^__pl_(o|key|exit|offer)=/.test(c)).map((c) => c.replace(/^__plh-/, '__Host-'));
   if (cookies.length) h.set('cookie', cookies.join('; '));
   // Origin/Referer must look like the real site, not the proxy.
   const fix = (v) => { try { const u = new URL(v); const p = parseProxyUrl(u.pathname + u.search); return p ? p.url.href : v; } catch { return v; } };
@@ -164,7 +166,7 @@ async function proxy(req, res, p, urlObj) {
     if (cause.code === 'PL_REMOTE_OFFLINE') return remoteGone(res);
     if (cause.code === 'PL_BLOCKED') return page(res, 403, 'Blocked', `<p>${esc(cause.message)}</p>`);
     if (ac.signal.aborted) return;
-    return page(res, 502, 'Could not reach site', `<p>${esc(target.host)}: ${esc(cause.code || cause.message)}</p>`);
+    return page(res, 502, 'Could not reach site', `<p>${esc(target.host)}: ${esc(ex ? cause.message : (cause.code || cause.message))}</p>`);
   }
 
   if (DEBUG && (up.status >= 400)) console.warn(`[upstream ${up.status}] ${method} ${target.href.slice(0, 200)}`);
@@ -227,6 +229,10 @@ async function handle(req, res) {
   const u = new URL(req.url, 'http://x');
 
   if (u.pathname === '/healthz') { res.writeHead(200); return res.end('ok'); }
+  if (u.pathname === '/agent.js') { // the helper contains no secrets; it is useless without a one-time code
+    res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'content-disposition': 'attachment; filename="agent.js"', 'cache-control': 'no-cache' });
+    return res.end(AGENT_JS);
+  }
 
   if (ACCESS_KEY) {
     const key = u.searchParams.get('key');
@@ -245,6 +251,10 @@ async function handle(req, res) {
 
   if (u.pathname.startsWith('/__pl/exit/') && await exit.route(req, res, u)) return;
 
+  if (u.pathname === '/share') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+    return res.end(SHARE_HTML);
+  }
   if (u.pathname === '/' || u.pathname === '/index.html') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     return res.end(INDEX_HTML);
@@ -305,7 +315,7 @@ server.on('upgrade', (req, socket, head) => {
     origin: `${proto === 'wss:' ? 'https' : 'http'}://${t.host}`,
     'user-agent': SPOOF_UA || req.headers['user-agent'] || '',
   };
-  const cookies = (req.headers.cookie || '').split(/;\s*/).filter((c) => c && !/^__pl_(o|key|exit)=/.test(c)).map((c) => c.replace(/^__plh-/, '__Host-'));
+  const cookies = (req.headers.cookie || '').split(/;\s*/).filter((c) => c && !/^__pl_(o|key|exit|offer)=/.test(c)).map((c) => c.replace(/^__plh-/, '__Host-'));
   if (cookies.length) headers.cookie = cookies.join('; ');
 
   const upstream = new WebSocket(t.href, protocols, { headers, lookup: safeLookup, handshakeTimeout: 15_000 });

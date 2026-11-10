@@ -1,28 +1,36 @@
 // "Exit via another computer" mode.
 //
-//   Computer A (shares its internet)  --WebSocket-->  this server  <--HTTPS--  Computer B (browses)
+//   Computer A (shares its internet)  --tunnel-->  this server  <--HTTPS--  Computer B (browses)
 //
-// A runs agent.js, presses a button and sets a PIN. B enters the PIN on the start page. From then on B's
-// proxied requests are executed by A's agent, so sites see A's IP address. Requires ACCESS_KEY.
+// 1. On A, open /share in a browser, set a PIN and press "Allow sharing". That creates an *offer* with a
+//    one-time pairing code (browser consent).
+// 2. A runs `node agent.js <server> <code>`; the helper claims the offer and opens the tunnel.
+// 3. B enters the PIN on the start page. B's proxied requests are then executed by A's helper, so sites see A's IP.
+// Requires ACCESS_KEY.
 //
 // Tunnel protocol (WebSocket):
-//   text frames  (JSON):  hello / ready / reject / viewers / expired / req / res / err / cancel
-//   binary frames:        [uint32 request-id][uint8 flag: 0=data, 1=end][payload]
+//   text frames (JSON):  ready / stop / expired / viewers (server->agent), req / res / err / cancel
+//   binary frames:       [uint32 request-id][uint8 flag: 0=data, 1=end][payload]
 import crypto from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 
 const TEN_MIN = 10 * 60 * 1000;
 const SESSION_MS = 12 * 60 * 60 * 1000;
+const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const norm = (c) => String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 
 export function createExit(d) {
   const enabled = !!d.ACCESS_KEY;
   const secret = crypto.randomBytes(32);
   const pinKey = (pin) => crypto.createHmac('sha256', secret).update(String(pin)).digest('hex');
 
-  const hosts = new Map();     // pinKey -> host
-  const sessions = new Map();  // token  -> { host, exp }
-  const fails = new Map();     // ip     -> { n, t }
-  const hits = [];             // timestamps of failed PIN attempts (global)
+  const offers = new Map();    // id -> offer
+  const byCode = new Map();    // normalised pairing code -> offer (until claimed)
+  const byResume = new Map();  // resume token -> offer (after claimed)
+  const hosts = new Map();     // pinKey -> host (helper currently connected)
+  const sessions = new Map();  // viewer token -> { host, exp }
+  const fails = new Map();     // ip -> { n, t }
+  const hits = [];             // global failed-PIN timestamps
   let lockUntil = 0;
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
@@ -33,15 +41,31 @@ export function createExit(d) {
   };
   const clientIp = (req) =>
     req.headers['cf-connecting-ip'] || (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || '?';
-  const cookie = (req, v, maxAge) =>
-    `__pl_exit=${v}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${d.isHttps(req) ? '; Secure' : ''}`;
+  const setCookie = (req, name, v, maxAge) =>
+    `${name}=${v}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${d.isHttps(req) ? '; Secure' : ''}`;
+  const readJson = async (req) => { try { return JSON.parse((await d.readBody(req, 2048)).toString()) || {}; } catch { return {}; } };
+  const isJsonReq = (req) => (req.headers['content-type'] || '').split(';')[0] === 'application/json';
+  const pinTaken = (key) => hosts.has(key) || [...offers.values()].some((o) => o.pinKey === key);
 
-  /* ------------------------------------------------------------ host side */
+  /* --------------------------------------------------------------- offers */
+
+  function endOffer(offer, why) {
+    if (offer.ended) return;
+    offer.ended = true;
+    clearTimeout(offer.pendingTimer); clearTimeout(offer.timer);
+    offers.delete(offer.id);
+    if (offer.code) byCode.delete(offer.code);
+    if (offer.resume) byResume.delete(offer.resume);
+    if (offer.ws) {
+      try { offer.ws.send(JSON.stringify({ t: 'stop', why })); } catch { /* gone */ }
+      try { offer.ws.close(1000, 'stopped'); } catch { /* gone */ }
+    }
+    if (offer.host) closeHost(offer.host);
+  }
 
   function closeHost(host) {
     if (host.closed) return;
     host.closed = true;
-    clearTimeout(host.timer);
     if (hosts.get(host.key) === host) hosts.delete(host.key);
     for (const t of host.sessions) sessions.delete(t);
     host.sessions.clear();
@@ -50,39 +74,24 @@ export function createExit(d) {
   }
 
   const notifyViewers = (host) => {
-    if (host.ws.readyState === WebSocket.OPEN) host.ws.send(JSON.stringify({ t: 'viewers', n: host.sessions.size, reqs: host.stats.reqs }));
+    if (host.ws.readyState === WebSocket.OPEN) host.ws.send(JSON.stringify({ t: 'viewers', n: host.sessions.size }));
   };
 
-  function onAgent(ws) {
-    let host = null;
+  function onAgent(ws, offer) {
+    if (offer.ws && offer.ws !== ws) { try { offer.ws.terminate(); } catch { /* gone */ } } // helper reconnecting
+    const host = { ws, key: offer.pinKey, offer, inflight: new Map(), blocked: new Set(), nextId: 0, sessions: new Set(), closed: false, stats: offer.stats };
+    offer.ws = ws; offer.host = host;
+    hosts.set(host.key, host);
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
-    const helloTimer = setTimeout(() => ws.close(1008, 'hello timeout'), 10_000);
-    const reject = (code, reason) => { ws.send(JSON.stringify({ t: 'reject', code, reason })); ws.close(1000, 'rejected'); };
+    ws.send(JSON.stringify({ t: 'ready', expiresAt: offer.expiresAt, resume: offer.resume }));
 
     ws.on('message', (data, isBinary) => {
-      if (!host) {
-        let m;
-        try { m = JSON.parse(data.toString()); } catch { return ws.close(1008); }
-        if (isBinary || m.t !== 'hello') return ws.close(1008);
-        clearTimeout(helloTimer);
-        const pin = String(m.pin || '');
-        if (!/^\d{4,8}$/.test(pin)) return reject('bad_pin', 'The PIN must be 4 to 8 digits');
-        const key = pinKey(pin);
-        if (hosts.has(key)) return reject('in_use', 'That PIN is already in use. Choose a different one');
-        const minutes = Math.min(Math.max(parseInt(m.minutes, 10) || 60, 1), 480);
-        host = { ws, key, inflight: new Map(), blocked: new Set(), nextId: 0, sessions: new Set(), closed: false,
-          stats: { reqs: 0 }, expires: Date.now() + minutes * 60_000 };
-        host.timer = setTimeout(() => { try { ws.send(JSON.stringify({ t: 'expired' })); } catch { /* gone */ } ws.close(1000, 'expired'); }, minutes * 60_000);
-        hosts.set(key, host);
-        ws.send(JSON.stringify({ t: 'ready', expiresAt: host.expires }));
-        return;
-      }
       if (isBinary) {
-        const id = data.readUInt32BE(0), flag = data[4];
-        const e = host.inflight.get(id);
+        if (data.length < 5) return;
+        const e = host.inflight.get(data.readUInt32BE(0));
         if (!e) return;
-        if (flag === 0) e.data(data.subarray(5)); else e.end();
+        if (data[4] === 0) e.data(data.subarray(5)); else e.end();
         return;
       }
       let m;
@@ -91,11 +100,14 @@ export function createExit(d) {
       if (!e) return;
       if (m.t === 'res') e.res(m); else if (m.t === 'err') e.err(m);
     });
-    ws.on('close', () => { clearTimeout(helloTimer); if (host) closeHost(host); });
+    ws.on('close', () => {
+      closeHost(host);
+      if (offer.host === host) { offer.host = null; offer.ws = null; } // offer stays so the helper can resume
+    });
     ws.on('error', () => { /* handled by close */ });
   }
 
-  // Drop dead agents (Render's proxy silently kills idle sockets) and expired sessions.
+  // Drop dead helpers (Render's proxy silently kills idle sockets) and expired viewer sessions.
   setInterval(() => {
     for (const ws of wss.clients) {
       if (!ws.isAlive) { ws.terminate(); continue; }
@@ -109,12 +121,29 @@ export function createExit(d) {
   function handleAgentUpgrade(req, socket, head) {
     const fail = (code, msg) => { socket.write(`HTTP/1.1 ${code} ${msg}\r\nConnection: close\r\n\r\n`); socket.destroy(); };
     if (!enabled) return fail(403, 'Forbidden');
-    const tok = req.headers['x-pl-auth'];
-    if (!tok || !d.safeEq(String(tok), d.authToken())) return fail(401, 'Unauthorized');
-    wss.handleUpgrade(req, socket, head, onAgent);
+    const q = new URL(req.url, 'http://x').searchParams;
+    let offer = null;
+    const code = norm(q.get('code'));
+    const resume = q.get('resume');
+    if (code) {
+      offer = byCode.get(code);
+      if (offer && !offer.ended) { // first connection: the code is single use
+        byCode.delete(code); offer.code = null;
+        clearTimeout(offer.pendingTimer);
+        offer.claimed = true;
+        offer.expiresAt = Date.now() + offer.minutes * 60_000;
+        offer.timer = setTimeout(() => endOffer(offer, 'expired'), offer.minutes * 60_000);
+        offer.resume = crypto.randomBytes(24).toString('hex');
+        byResume.set(offer.resume, offer);
+      } else offer = null;
+    } else if (resume) {
+      offer = byResume.get(resume) || null;
+    }
+    if (!offer || offer.ended) return fail(401, 'Unauthorized');
+    wss.handleUpgrade(req, socket, head, (ws) => onAgent(ws, offer));
   }
 
-  /* ------------------------------------------------------- viewer (B) side */
+  /* ----------------------------------------------------------------- HTTP */
 
   function getExit(req) {
     const t = d.parseCookies(req.headers.cookie).__pl_exit;
@@ -124,27 +153,36 @@ export function createExit(d) {
     return s;
   }
 
+  const myOffer = (req) => offers.get(d.parseCookies(req.headers.cookie).__pl_offer || '') || null;
+
+  function offerStatus(req) {
+    const o = myOffer(req);
+    if (!o) return { state: d.parseCookies(req.headers.cookie).__pl_offer ? 'ended' : 'none' };
+    const base = { recent: o.recent, reqs: o.stats.reqs, viewers: o.host ? o.host.sessions.size : 0 };
+    if (!o.claimed) return { ...base, state: 'waiting', code: o.display, codeExpiresAt: o.created + TEN_MIN };
+    return { ...base, state: o.host ? 'active' : 'reconnecting', expiresAt: o.expiresAt };
+  }
+
   async function route(req, res, u) {
     const p = u.pathname;
 
+    /* --- computer B: use someone's connection --- */
     if (p === '/__pl/exit/status') {
       const s = getExit(req);
       json(res, 200, { enabled, connected: !!(s && !s.gone), offline: !!(s && s.gone) });
       return true;
     }
-
     if (p === '/__pl/exit/off') {
       const t = d.parseCookies(req.headers.cookie).__pl_exit;
       const s = t && sessions.get(t);
       if (s) { sessions.delete(t); s.host.sessions.delete(t); notifyViewers(s.host); }
-      res.writeHead(302, { location: '/', 'set-cookie': cookie(req, '', 0) });
+      res.writeHead(302, { location: '/', 'set-cookie': setCookie(req, '__pl_exit', '', 0) });
       res.end();
       return true;
     }
-
     if (p === '/__pl/exit/connect' && req.method === 'POST') {
       if (!enabled) { json(res, 403, { ok: false, error: 'This mode is disabled until ACCESS_KEY is set on the server' }); return true; }
-      if ((req.headers['content-type'] || '').split(';')[0] !== 'application/json') { json(res, 415, { ok: false, error: 'Bad request' }); return true; }
+      if (!isJsonReq(req)) { json(res, 415, { ok: false, error: 'Bad request' }); return true; }
       const now = Date.now();
       if (now < lockUntil) { json(res, 429, { ok: false, error: 'Too many wrong PINs. Try again in a few minutes' }); return true; }
       const ip = clientIp(req);
@@ -152,8 +190,7 @@ export function createExit(d) {
       if (!f || now - f.t > TEN_MIN) f = { n: 0, t: now };
       if (f.n >= 5) { json(res, 429, { ok: false, error: 'Too many wrong PINs from your address. Try again later' }); return true; }
 
-      let pin = '';
-      try { pin = String(JSON.parse((await d.readBody(req, 1024)).toString()).pin || ''); } catch { /* empty */ }
+      const pin = String((await readJson(req)).pin || '');
       const host = /^\d{4,8}$/.test(pin) ? hosts.get(pinKey(pin)) : null;
       if (!host || host.closed) {
         f.n++; fails.set(ip, f);
@@ -170,7 +207,43 @@ export function createExit(d) {
       sessions.set(token, { host, exp: now + SESSION_MS });
       host.sessions.add(token);
       notifyViewers(host);
-      json(res, 200, { ok: true }, { 'set-cookie': cookie(req, token, SESSION_MS / 1000) });
+      json(res, 200, { ok: true }, { 'set-cookie': setCookie(req, '__pl_exit', token, SESSION_MS / 1000) });
+      return true;
+    }
+
+    /* --- computer A: offer to share (driven by /share in the browser) --- */
+    if (p === '/__pl/exit/offer' && req.method === 'GET') { json(res, 200, { enabled, ...offerStatus(req) }); return true; }
+
+    if (p === '/__pl/exit/offer' && req.method === 'POST') {
+      if (!enabled) { json(res, 403, { ok: false, error: 'Set ACCESS_KEY on the server to enable sharing' }); return true; }
+      if (!isJsonReq(req)) { json(res, 415, { ok: false, error: 'Bad request' }); return true; }
+      const b = await readJson(req);
+      const pin = String(b.pin || '');
+      if (!/^\d{4,8}$/.test(pin)) { json(res, 400, { ok: false, error: 'The PIN must be 4 to 8 digits' }); return true; }
+      const minutes = Math.min(Math.max(parseInt(b.minutes, 10) || 60, 5), 480);
+      const prev = myOffer(req);
+      if (prev) endOffer(prev, 'replaced');
+      if (pinTaken(pinKey(pin))) { json(res, 409, { ok: false, error: 'That PIN is already in use. Choose a different one' }); return true; }
+      if (offers.size >= 20) { json(res, 429, { ok: false, error: 'Too many active shares' }); return true; }
+
+      let raw = '';
+      for (const x of crypto.randomBytes(8)) raw += ALPHABET[x % ALPHABET.length];
+      const offer = {
+        id: crypto.randomBytes(16).toString('hex'), code: raw, display: `${raw.slice(0, 4)}-${raw.slice(4)}`,
+        pinKey: pinKey(pin), minutes, created: Date.now(), claimed: false, expiresAt: 0, resume: null,
+        host: null, ws: null, ended: false, stats: { reqs: 0 }, recent: [],
+      };
+      offer.pendingTimer = setTimeout(() => endOffer(offer, 'unclaimed'), TEN_MIN); // code must be used within 10 min
+      offers.set(offer.id, offer); byCode.set(raw, offer);
+      json(res, 200, { ok: true, ...offerStatus({ headers: { cookie: `__pl_offer=${offer.id}` } }) },
+        { 'set-cookie': setCookie(req, '__pl_offer', offer.id, 86400) });
+      return true;
+    }
+
+    if (p === '/__pl/exit/offer/stop' && req.method === 'POST') {
+      const o = myOffer(req);
+      if (o) endOffer(o, 'stopped from the browser');
+      json(res, 200, { ok: true });
       return true;
     }
     return false;
@@ -227,6 +300,11 @@ export function createExit(d) {
 
       signal?.addEventListener('abort', onAbort, { once: true });
       host.stats.reqs++;
+      try {
+        const o = host.offer;
+        o.recent.unshift(`${method} ${new URL(url).host}`);
+        o.recent.length = Math.min(o.recent.length, 10);
+      } catch { /* ignore */ }
       const hasBody = !!(body && body.length);
       host.ws.send(JSON.stringify({ t: 'req', id, method, url, headers, hasBody }));
       if (hasBody) {
