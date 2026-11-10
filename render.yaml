@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: render-proxy
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: ACCESS_KEY      # set this in the dashboard; stops strangers using your proxy
+        sync: false
