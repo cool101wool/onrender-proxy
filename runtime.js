@@ -4,16 +4,27 @@
 (function () {
   'use strict';
   if (window.__pl) return;
+  var TOP = window;
 
   var RealLoc = window.location;
   var ORIGIN = RealLoc.origin;
   var PROXIED = /^\/p\/(https?|wss?)\/[^\/]/;
   var SKIP = /^(?:data|blob|javascript|mailto|tel|about|sms):/i;
+
+  // Everything below is realm-specific, so it is applied to the page AND to same-origin iframes
+  // (sites like YouTube create a hidden about:blank iframe to grab pristine copies of
+  // history.pushState / fetch / XMLHttpRequest and would otherwise bypass the patches).
+  function install(window) {
+  if (window.__pl) return;
+  var document = window.document, navigator = window.navigator, Element = window.Element, Node = window.Node,
+      Document = window.Document, History = window.History, XMLHttpRequest = window.XMLHttpRequest,
+      Response = window.Response, DOMParser = window.DOMParser, MutationObserver = window.MutationObserver,
+      HTMLMetaElement = window.HTMLMetaElement, HTMLScriptElement = window.HTMLScriptElement,
+      HTMLFormElement = window.HTMLFormElement, Function = window.Function, Navigation = window.Navigation;
   var oGetAttr = Element.prototype.getAttribute;
   var oSetAttr = Element.prototype.setAttribute;
   var xhrOpen = XMLHttpRequest.prototype.open;
   var xhrSend = XMLHttpRequest.prototype.send;
-  var baseGet = Object.getOwnPropertyDescriptor(Node.prototype, 'baseURI').get;
 
   /* ---------- URL helpers ---------- */
   function parseReal(p) {
@@ -30,7 +41,7 @@
     return v;
   }
   function curReal() { return parseReal(RealLoc.pathname + RealLoc.search + RealLoc.hash) || new URL(RealLoc.href); }
-  function realBase() { return unprox(baseGet.call(document)); }
+  function realBase() { return unprox(TOP.document.baseURI); } // always the top page: about:blank iframes have no useful base
   function proxify(u, base) {
     if (u == null) return u;
     if (u instanceof URL) u = u.href;
@@ -323,4 +334,20 @@
     }
   }).observe(document, { subtree: true, childList: true, attributes: true,
     attributeFilter: ['href', 'src', 'action', 'formaction', 'poster', 'data', 'srcset', 'content'] });
+
+  /* ---------- same-origin iframes get the same patches the moment script can reach them ---------- */
+  function prepare(w) { try { if (w && !w.__pl && w.document) install(w); } catch (e) { /* cross-origin */ } }
+  ['contentWindow', 'contentDocument'].forEach(function (n) {
+    var d = Object.getOwnPropertyDescriptor(window.HTMLIFrameElement.prototype, n);
+    if (!d || !d.get) return;
+    Object.defineProperty(window.HTMLIFrameElement.prototype, n, { configurable: true, enumerable: true,
+      get: function () {
+        var v = d.get.call(this);
+        try { prepare(n === 'contentWindow' ? v : v && v.defaultView); } catch (e) {}
+        return v;
+      } });
+  });
+  } // end install
+
+  install(window);
 })();
