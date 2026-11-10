@@ -15,6 +15,11 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
 const ACCESS_KEY = process.env.ACCESS_KEY || '';
+// Tor Browser (Firefox ESR on Windows) user agent. Set USER_AGENT=off to pass the visitor's own UA through,
+// or USER_AGENT=<any string> to use your own.
+const UA_ENV = process.env.USER_AGENT;
+const SPOOF_UA = UA_ENV === 'off' ? null : (UA_ENV || 'Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0');
+const DEBUG = process.env.DEBUG_PROXY === '1';
 const MAX_BODY_IN = 50 * 1024 * 1024;
 const MAX_REWRITE = 15 * 1024 * 1024;
 
@@ -96,9 +101,11 @@ function upstreamHeaders(req, target) {
   const h = new Headers();
   for (const [k, v] of Object.entries(req.headers)) {
     if (DROP_REQ.has(k) || k.startsWith('x-forwarded-') || k.startsWith('x-render') || k.startsWith('cf-') || k.startsWith('sec-fetch-')) continue;
+    if (SPOOF_UA && (k.startsWith('sec-ch-ua') || k === 'user-agent')) continue; // Chrome client hints would contradict a Firefox UA
     if (k === 'cookie') continue;
     h.set(k, Array.isArray(v) ? v.join(', ') : v);
   }
+  if (SPOOF_UA) h.set('user-agent', SPOOF_UA);
   const cookies = (req.headers.cookie || '').split(/;\s*/).filter((c) => c && !/^__pl_(o|key)=/.test(c)).map((c) => c.replace(/^__plh-/, '__Host-'));
   if (cookies.length) h.set('cookie', cookies.join('; '));
   // Origin/Referer must look like the real site, not the proxy.
@@ -134,11 +141,13 @@ async function proxy(req, res, p, urlObj) {
     });
   } catch (e) {
     const cause = e.cause || e;
+    console.error(`[upstream error] ${method} ${target.href.slice(0, 200)} -> ${cause.code || cause.message}`);
     if (cause.code === 'PL_BLOCKED') return page(res, 403, 'Blocked', `<p>${esc(cause.message)}</p>`);
     if (ac.signal.aborted) return;
     return page(res, 502, 'Could not reach site', `<p>${esc(target.host)}: ${esc(cause.code || cause.message)}</p>`);
   }
 
+  if (DEBUG && (up.status >= 400)) console.warn(`[upstream ${up.status}] ${method} ${target.href.slice(0, 200)}`);
   const https = isHttps(req);
   const out = {};
   const set = (k, v) => { out[k] = v; };
@@ -270,7 +279,7 @@ server.on('upgrade', (req, socket, head) => {
   const protocols = (req.headers['sec-websocket-protocol'] || '').split(',').map((s) => s.trim()).filter(Boolean);
   const headers = {
     origin: `${proto === 'wss:' ? 'https' : 'http'}://${t.host}`,
-    'user-agent': req.headers['user-agent'] || '',
+    'user-agent': SPOOF_UA || req.headers['user-agent'] || '',
   };
   const cookies = (req.headers.cookie || '').split(/;\s*/).filter((c) => c && !/^__pl_(o|key)=/.test(c)).map((c) => c.replace(/^__plh-/, '__Host-'));
   if (cookies.length) headers.cookie = cookies.join('; ');
